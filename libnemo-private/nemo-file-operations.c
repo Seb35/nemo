@@ -182,9 +182,17 @@ typedef struct {
 	OpKind op;
 	guint64 last_report_time;
 	int last_reported_files_left;
+	gint64 mean_unit_time;
+	gint64 sqr_unit_time;
+	goffset mean_unit_size;
+	goffset sqr_unit_size;
+	int last_num_files;
+	goffset last_num_bytes;
+	gint64 last_partial_file_time;
+	goffset last_partial_file_size;
 } TransferInfo;
 
-#define SECONDS_NEEDED_FOR_RELIABLE_TRANSFER_RATE 15
+#define SECONDS_NEEDED_FOR_RELIABLE_TRANSFER_RATE 0
 #define NSEC_PER_MICROSEC 1000
 
 #define MAXIMUM_DISPLAYED_FILE_NAME_LENGTH 50
@@ -3049,6 +3057,11 @@ report_copy_progress (CopyMoveJob *copy_job,
 	guint64 now;
 	CommonJob *job;
 	gboolean is_move;
+	gint64 this_time, delta_time, temp_time;
+	int this_num_files;
+	goffset this_size, delta_size, temp_size;
+	double inv_internal_transfer_rate, init_transfer_time;
+	int remaining_time_corrected;
 
 	job = (CommonJob *)copy_job;
 
@@ -3059,6 +3072,10 @@ report_copy_progress (CopyMoveJob *copy_job,
 	if (transfer_info->last_report_time != 0 &&
 	    ABS ((gint64)(transfer_info->last_report_time - now)) < 100 * NSEC_PER_MICROSEC) {
 		return;
+	}
+	this_time = 0;
+	if (transfer_info->last_report_time != 0) {
+		this_time = now - transfer_info->last_report_time;
 	}
 	transfer_info->last_report_time = now;
 	
@@ -3135,6 +3152,49 @@ report_copy_progress (CopyMoveJob *copy_job,
 		transfer_rate = transfer_info->num_bytes / elapsed;
 	}
 
+	/* Improvement of the remaining time */
+	if (this_time != 0) {
+		if (transfer_info->num_files == transfer_info->last_num_files && transfer_info->num_files > 0) {
+			this_num_files = 1;
+			this_time = this_time + transfer_info->mean_unit_time;
+			this_size = (transfer_info->num_bytes - transfer_info->last_num_bytes) + transfer_info->mean_unit_size;
+		}
+		else {
+			this_num_files = transfer_info->num_files - transfer_info->last_num_files;
+			this_time = this_time / this_num_files;
+			this_size = (transfer_info->num_bytes - transfer_info->last_num_bytes) / this_num_files;
+			transfer_info->last_partial_file_time = 0;
+			transfer_info->last_partial_file_size = 0;
+		}
+
+	/* Iterative formulae for computing mean and variance-without-factor - see Donald E. Knuth (1998). The Art of Computer Programming, volume 2: Seminumerical Algorithms, 3rd edn., p. 232. Boston: Addison-Wesley. */
+		delta_time = this_time - transfer_info->mean_unit_time;
+		delta_size = this_size - transfer_info->mean_unit_size;
+		transfer_info->mean_unit_time += delta_time * this_num_files / transfer_info->num_files;
+		transfer_info->mean_unit_size += delta_size * this_num_files / transfer_info->num_files;
+		transfer_info->sqr_unit_time += delta_time * (this_time - transfer_info->mean_unit_time) - transfer_info->last_partial_file_time;
+		transfer_info->sqr_unit_size += delta_size * (this_size - transfer_info->mean_unit_size) - transfer_info->last_partial_file_size;
+
+		temp_time = delta_time * (this_time - transfer_info->mean_unit_time) - transfer_info->last_partial_file_time;
+		temp_size = delta_size * (this_size - transfer_info->mean_unit_size) - transfer_info->last_partial_file_size;
+		transfer_info->last_partial_file_time = delta_time * (this_time - transfer_info->mean_unit_time) * this_num_files;
+		transfer_info->last_partial_file_size = delta_size * (this_size - transfer_info->mean_unit_size) * this_num_files;
+
+		inv_internal_transfer_rate = sqrt( ((double)(transfer_info->sqr_unit_time)) / ((double)(transfer_info->sqr_unit_size)) );
+		init_transfer_time = elapsed * 1000000 / transfer_info->num_files - transfer_info->mean_unit_size * inv_internal_transfer_rate;
+
+		if (init_transfer_time < 10) {
+			init_transfer_time = 10;
+			inv_internal_transfer_rate = (elapsed * 1000000 / transfer_info->num_files - init_transfer_time) / transfer_info->mean_unit_size;
+		}
+
+		transfer_info->last_num_files = transfer_info->num_files;
+		transfer_info->last_num_bytes = transfer_info->num_bytes;
+
+		remaining_time_corrected = (files_left * init_transfer_time + (total_size - transfer_info->num_bytes) * inv_internal_transfer_rate) / 1000000;
+	}
+	/* End of Improvement of the remaining time */
+
 	if (elapsed < SECONDS_NEEDED_FOR_RELIABLE_TRANSFER_RATE &&
 	    transfer_rate > 0) {
 		char *s;
@@ -3144,18 +3204,47 @@ report_copy_progress (CopyMoveJob *copy_job,
 	} else {
 		char *s;
 		remaining_time = (total_size - transfer_info->num_bytes) / transfer_rate;
+		if (transfer_info->num_files < 2) remaining_time_corrected = remaining_time;
 
 		/* To translators: %S will expand to a size like "2 bytes" or "3 MB", %T to a time duration like
 		 * "2 minutes". So the whole thing will be something like "2 kb of 4 MB -- 2 hours left (4kb/sec)"
 		 *
 		 * The singular/plural form will be used depending on the remaining time (i.e. the %T argument).
 		 */		
-		s = f (ngettext ("%S of %S \xE2\x80\x94 %T left (%S/sec)",
-				 "%S of %S \xE2\x80\x94 %T left (%S/sec)",
-				 seconds_count_format_time_units (remaining_time)),
+		s = f (ngettext (
+		                 "%S of %S\n%T left (%S/s)\n%T left (%S/s + %.0f µs/file)\nnow=%li\nnum_files=%li\nthis_num_files=%li\nthis_time=%li\nthis_size=%li\ndelta_time=%li\ndelta_size=%li\nmean_unit_time=%li\nstd_unit_time=%li\nmean_unit_size=%li\nstd_unit_size=%li\ninv_internal_transfer_rate=%f\ninit_transfer_time=%f\ntime init=%.1f s\ntime transfer=%.1f s\nadded to time: mean=%li std=%li\nadded to size: mean=%li std=%li\ntotal_time=%.1f\ntime_per_file=%.1f\nmean_transfer_time=%.1f\ntotal_init_time=%f\nrapport temps transfer/init=%.4f",
+		                 "%S of %S\n%T left (%S/s)\n%T left (%S/s + %.0f µs/file)\nnow=%li\nnum_files=%li\nthis_num_files=%li\nthis_time=%li\nthis_size=%li\ndelta_time=%li\ndelta_size=%li\nmean_unit_time=%li\nstd_unit_time=%li\nmean_unit_size=%li\nstd_unit_size=%li\ninv_internal_transfer_rate=%f\ninit_transfer_time=%f\ntime init=%.1f s\ntime transfer=%.1f s\nadded to time: mean=%li std=%li\nadded to size: mean=%li std=%li\ntotal_time=%.1f\ntime_per_file=%.1f\nmean_transfer_time=%.1f\ntotal_init_time=%f\nrapport temps transfer/init=%.4f",
+		                 seconds_count_format_time_units (remaining_time)),
 		       transfer_info->num_bytes, total_size,
 		       remaining_time,
-		       (goffset)transfer_rate);
+		       (goffset)transfer_rate,
+		       remaining_time_corrected,
+		       (goffset)(1000000.0/inv_internal_transfer_rate),
+		       init_transfer_time,
+		       now,
+		       transfer_info->num_files,
+		       this_num_files,
+		       this_time,
+		       this_size,
+		       delta_time,
+		       delta_size,
+		       transfer_info->mean_unit_time,
+		       (gint64)sqrt((double)((transfer_info->sqr_unit_time/(MAX(2,transfer_info->num_files)-1)))),
+		       transfer_info->mean_unit_size,
+		       (goffset)sqrt((double)((transfer_info->sqr_unit_size/(MAX(2,transfer_info->num_files)-1)))),
+		       inv_internal_transfer_rate,
+		       init_transfer_time,
+		       (files_left * init_transfer_time) / 1000000,
+		       ((total_size - transfer_info->num_bytes) * inv_internal_transfer_rate) / 1000000,
+		       (gint64) (delta_time * this_num_files / transfer_info->num_files),
+		       temp_time,
+		       (gint64) (delta_size * this_num_files / transfer_info->num_files),
+		       temp_size,
+		       elapsed * 1000000,
+		       elapsed * 1000000 / transfer_info->num_files,
+		       transfer_info->mean_unit_size * inv_internal_transfer_rate,
+		       init_transfer_time * transfer_info->num_files,
+		       ((double)(inv_internal_transfer_rate * transfer_info->mean_unit_size)) / init_transfer_time);
 		nemo_progress_info_take_details (job->progress, s);
 	}
 
@@ -4735,6 +4824,7 @@ copy_job (GIOSchedulerJob *io_job,
 	g_timer_start (job->common.time);
 	
 	memset (&transfer_info, 0, sizeof (transfer_info));
+	transfer_info.last_report_time = g_get_monotonic_time();
 	copy_files (job,
 		    dest_fs_id,
 		    &source_info, &transfer_info);
@@ -5301,6 +5391,7 @@ move_job (GIOSchedulerJob *io_job,
 	}
 
 	memset (&transfer_info, 0, sizeof (transfer_info));
+	transfer_info.last_report_time = g_get_monotonic_time();
 	move_files (job,
 		    fallbacks,
 		    dest_fs_id, &dest_fs_type,
